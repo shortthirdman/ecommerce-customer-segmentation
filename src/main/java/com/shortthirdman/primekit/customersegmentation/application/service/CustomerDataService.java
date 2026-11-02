@@ -1,0 +1,152 @@
+package com.shortthirdman.primekit.customersegmentation.application.service;
+
+import com.shortthirdman.primekit.customersegmentation.application.batch.CustomerSegmentationPolicy;
+import com.shortthirdman.primekit.customersegmentation.domain.entity.Customer;
+import com.shortthirdman.primekit.customersegmentation.domain.entity.CustomerTier;
+import com.shortthirdman.primekit.customersegmentation.domain.model.CustomerSeed;
+import com.shortthirdman.primekit.customersegmentation.domain.model.CustomerStatistics;
+import com.shortthirdman.primekit.customersegmentation.domain.model.SegmentationPreview;
+import com.shortthirdman.primekit.customersegmentation.domain.repository.CustomerRepository;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.json.bind.Jsonb;
+import jakarta.json.bind.JsonbBuilder;
+import jakarta.json.bind.JsonbException;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.logging.Logger;
+import java.util.stream.Stream;
+
+@ApplicationScoped
+public class CustomerDataService {
+
+    private static final Logger LOGGER = Logger.getLogger(CustomerDataService.class.getName());
+    private static final String CUSTOMERS_JSON = "/customers.json";
+
+    @Inject
+    private CustomerRepository customerRepository;
+
+    List<Customer> loadCustomers() {
+        try (InputStream stream =
+                     CustomerDataService.class.getResourceAsStream(CUSTOMERS_JSON)) {
+
+            if (stream == null) {
+                throw new IllegalStateException("Resource not found: " + CUSTOMERS_JSON);
+            }
+
+            CustomerSeed[] customers;
+            try (Jsonb jsonb = JsonbBuilder.create()) {
+                customers = jsonb.fromJson(stream, CustomerSeed[].class);
+            } catch (Exception je) {
+                throw new RuntimeException("Unable to read data from JSON", je);
+            }
+
+            return Stream.of(customers)
+                    .map(CustomerSeed::toCustomer)
+                    .toList();
+
+        } catch (IOException exception) {
+            throw new UncheckedIOException(
+                    "Unable to load customer data", exception);
+        }
+    }
+
+    public void initializeIfEmpty() {
+        try (Stream<Customer> customers = customerRepository.findAll()) {
+            if (customers.findAny().isPresent()) {
+                LOGGER.info("Customer data already exists; skipping import");
+                return;
+            }
+        }
+
+        List<Customer> customers = loadCustomers();
+        customerRepository.saveAll(customers);
+
+        LOGGER.info(() -> "Customer import completed: created=%d"
+                .formatted(customers.size()));
+    }
+
+    public Map<CustomerTier, Long> countByTier() {
+        return statistics().tierCounts();
+    }
+
+    public CustomerStatistics statistics() {
+        try (Stream<Customer> customers = customerRepository.findAll()) {
+            return summarize(customers.toList());
+        }
+    }
+
+    public SegmentationPreview segmentationPreview(CustomerSegmentationPolicy policy) {
+        Objects.requireNonNull(policy, "policy is required");
+
+        try (Stream<Customer> customers = customerRepository.findAll()) {
+            return calculatePreview(customers::iterator, policy);
+        }
+    }
+
+    static CustomerStatistics summarize(List<Customer> customers) {
+        EnumMap<CustomerTier, Long> counts = new EnumMap<>(CustomerTier.class);
+        for (CustomerTier tier : CustomerTier.values()) {
+            counts.put(tier, 0L);
+        }
+
+        long unclassifiedCustomers = 0;
+        for (Customer customer : customers) {
+            CustomerTier tier = customer.getTier();
+            if (tier == null) {
+                unclassifiedCustomers++;
+                continue;
+            }
+
+            counts.merge(tier, 1L, Long::sum);
+        }
+
+        if (unclassifiedCustomers > 0) {
+            long count = unclassifiedCustomers;
+            LOGGER.warning(() -> "Found %d customers without a tier"
+                    .formatted(count));
+        }
+
+        return new CustomerStatistics(customers.size(), counts);
+    }
+
+    static SegmentationPreview calculatePreview(
+            Iterable<Customer> customers,
+            CustomerSegmentationPolicy policy) {
+
+        EnumMap<CustomerTier, Long> currentCounts = emptyTierCounts();
+        EnumMap<CustomerTier, Long> projectedCounts = emptyTierCounts();
+
+        long totalCustomers = 0;
+        for (Customer customer : customers) {
+            CustomerTier currentTier = customer.getTier();
+            if (currentTier != null) {
+                currentCounts.merge(currentTier, 1L, Long::sum);
+            }
+
+            CustomerTier projectedTier = policy.tierFor(customer.getTotalSpent());
+            projectedCounts.merge(projectedTier, 1L, Long::sum);
+            totalCustomers++;
+        }
+
+        CustomerStatistics current =
+                new CustomerStatistics(totalCustomers, currentCounts);
+        CustomerStatistics projected =
+                new CustomerStatistics(totalCustomers, projectedCounts);
+        return new SegmentationPreview(current, projected);
+    }
+
+    private static EnumMap<CustomerTier, Long> emptyTierCounts() {
+        EnumMap<CustomerTier, Long> counts = new EnumMap<>(CustomerTier.class);
+        for (CustomerTier tier : CustomerTier.values()) {
+            counts.put(tier, 0L);
+        }
+        return counts;
+    }
+}
